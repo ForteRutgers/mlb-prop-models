@@ -1,0 +1,9 @@
+# Protect secret environment variables
+.env
+
+# Ignore PyCharm workspace files
+.idea/
+
+# Ignore Python virtual environment files
+.venv/
+__pycache__/
