@@ -1,0 +1,32 @@
+name: Daily MLB Prop Model Run
+
+on:
+  schedule:
+    # Runs every day at 12:00 PM UTC (8:00 AM Eastern Time)
+    - cron: '0 12 * * *'
+  workflow_dispatch: # Allows you to run it manually by clicking a button on GitHub
+
+jobs:
+  run-model:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install required packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy supabase pybaseball xgboost discord-webhook python-dotenv scikit-learn
+
+      - name: Run MLB Model Script
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python src/mlb_model_runner.py
