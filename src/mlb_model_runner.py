@@ -70,49 +70,48 @@ def run_mlb_model():
         print("⚠️ Training data is empty after feature engineering. Exiting.")
         return
 
+    # Features and target
     features = ['hard_hit_rate', 'launch_speed_avg', 'launch_angle_avg']
     X = train_df[features]
     y = train_df['is_hr']
 
-    print(f"🧠 Training XGBoost model on {len(X)} rows...")
+    print("🤖 Training XGBoost model...")
     model = xgb.XGBClassifier(
-        n_estimators=200,
-        max_depth=5,
-        learning_rate=0.05,
+        n_estimators=100,
+        max_depth=4,
+        learning_rate=0.1,
         use_label_encoder=False,
-        eval_metric='logloss'
+        eval_metric='logloss',
+        random_state=42
     )
     model.fit(X, y)
 
-    # Get latest row per batter for prediction
-    latest = train_df.sort_values('game_date').groupby('batter').tail(1).copy()
-    latest['projected_prob'] = model.predict_proba(latest[features])[:, 1] * 100
+    # Get latest stats per batter
+    print("🔮 Generating predictions...")
+    latest = train_df.sort_values('game_date').groupby('batter').last().reset_index()
+    latest_X = latest[features]
+    latest['hr_prob'] = model.predict_proba(latest_X)[:, 1]
 
-    # Lookup real player names
-    print("🔎 Looking up player names...")
+    # Look up player names
+    print("👤 Looking up player names...")
+    batter_ids = latest['batter'].dropna().astype(int).unique().tolist()
     try:
-        batter_ids = latest['batter'].unique().tolist()
-        lookup = playerid_reverse_lookup(batter_ids, key_type='mlbam')
-        lookup['player_name'] = lookup['name_first'] + ' ' + lookup['name_last']
-        name_map = dict(zip(lookup['key_mlbam'], lookup['player_name']))
-        latest['player_name'] = latest['batter'].map(name_map).fillna('Unknown Player')
+        id_lookup = playerid_reverse_lookup(batter_ids, key_type='mlbam')
+        id_lookup['full_name'] = id_lookup['name_first'].str.capitalize() + ' ' + id_lookup['name_last'].str.capitalize()
+        id_map = dict(zip(id_lookup['key_mlbam'], id_lookup['full_name']))
     except Exception as e:
-        print(f"⚠️ Name lookup failed: {e}")
-        latest['player_name'] = latest['batter'].apply(lambda x: f"Player_{x}")
+        print(f"⚠️ Player lookup failed: {e}")
+        id_map = {}
 
-    latest['team'] = 'TBD'
-
-    player_stats = latest[['player_name', 'team', 'projected_prob']].copy()
-
-    # Prepare predictions for Supabase
+    # Build predictions list
     predictions = []
-    for index, row in player_stats.iterrows():
-        prob = float(row['projected_prob'])
+    for _, row in latest.iterrows():
+        prob = round(float(row['hr_prob']) * 100, 4)
+        batter_id = int(row['batter'])
+        player_name = id_map.get(batter_id, 'Unknown Player')
 
-        # Keep all players — HR probabilities are naturally small
         edge = round((prob / 100) - 0.5, 4)
 
-        # Tiers calibrated for pitch-level HR probability
         if prob >= 2:
             confidence = "High"
         elif prob >= 1:
@@ -122,10 +121,10 @@ def run_mlb_model():
 
         predictions.append({
             "game_date": today,
-            "player_name": row['player_name'],
-            "team": row['team'],
+            "player_name": player_name,
+            "team": "TBD",
             "prop_type": "Home Run",
-            "projected_prob": round(prob, 4),
+            "projected_prob": prob,
             "implied_line": 0.5,
             "edge": edge,
             "confidence": confidence
@@ -144,6 +143,11 @@ def run_mlb_model():
     medium_conf = [p for p in predictions if p['confidence'] == 'Medium']
     low_conf = [p for p in predictions if p['confidence'] == 'Low']
 
+    # Filter out unknown players from top picks
+    high_conf_named = [p for p in high_conf if p['player_name'] != 'Unknown Player']
+    medium_conf_named = [p for p in medium_conf if p['player_name'] != 'Unknown Player']
+    low_conf_named = [p for p in low_conf if p['player_name'] != 'Unknown Player']
+
     webhook = DiscordWebhook(url=DISCORD_WEBHOOK_URL)
     embed = DiscordEmbed(
         title="⚾ MLB Prop Model Daily Update",
@@ -154,22 +158,22 @@ def run_mlb_model():
     embed.add_embed_field(name="✅ Medium Confidence (≥1%)", value=str(len(medium_conf)), inline=True)
     embed.add_embed_field(name="📉 Low Confidence (<1%)", value=str(len(low_conf)), inline=True)
 
-    if high_conf:
-        top_picks = sorted(high_conf, key=lambda x: x['projected_prob'], reverse=True)[:5]
+    if high_conf_named:
+        top_picks = sorted(high_conf_named, key=lambda x: x['projected_prob'], reverse=True)[:5]
         top_str = "\n".join([
             f"**{p['player_name']}** — {p['projected_prob']:.2f}% HR prob"
             for p in top_picks
         ])
         embed.add_embed_field(name="🎯 Top Picks Today", value=top_str, inline=False)
-    elif medium_conf:
-        top_picks = sorted(medium_conf, key=lambda x: x['projected_prob'], reverse=True)[:5]
+    elif medium_conf_named:
+        top_picks = sorted(medium_conf_named, key=lambda x: x['projected_prob'], reverse=True)[:5]
         top_str = "\n".join([
             f"**{p['player_name']}** — {p['projected_prob']:.2f}% HR prob"
             for p in top_picks
         ])
         embed.add_embed_field(name="🎯 Top Picks (Medium)", value=top_str, inline=False)
-    elif low_conf:
-        top_picks = sorted(low_conf, key=lambda x: x['projected_prob'], reverse=True)[:5]
+    elif low_conf_named:
+        top_picks = sorted(low_conf_named, key=lambda x: x['projected_prob'], reverse=True)[:5]
         top_str = "\n".join([
             f"**{p['player_name']}** — {p['projected_prob']:.2f}% HR prob"
             for p in top_picks
