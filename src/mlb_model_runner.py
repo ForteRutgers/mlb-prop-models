@@ -24,6 +24,13 @@ if not all([SUPABASE_URL, SUPABASE_KEY, DISCORD_WEBHOOK_URL]):
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
+def format_name(name):
+    """Properly capitalize names including initials like TJ, CJ, AJ etc."""
+    exceptions = {'tj', 'cj', 'aj', 'jt', 'jd', 'dj', 'bj', 'rj'}
+    return ' '.join(w.upper() if w.lower() in exceptions else w.capitalize() for w in name.split())
+
+
 def run_mlb_model():
     print("🚀 Starting MLB Prop Model Runner...")
 
@@ -75,7 +82,8 @@ def run_mlb_model():
     X = train_df[features]
     y = train_df['is_hr']
 
-    print("🤖 Training XGBoost model...")
+    print(f"🤖 Training XGBoost model on {len(X)} rows...")
+
     model = xgb.XGBClassifier(
         n_estimators=100,
         max_depth=4,
@@ -86,30 +94,36 @@ def run_mlb_model():
     )
     model.fit(X, y)
 
-    # Get latest stats per batter
-    print("🔮 Generating predictions...")
+    # Get latest stats per player
     latest = train_df.sort_values('game_date').groupby('batter').last().reset_index()
-    latest_X = latest[features]
-    latest['hr_prob'] = model.predict_proba(latest_X)[:, 1]
+    latest['projected_prob'] = model.predict_proba(latest[features])[:, 1] * 100
 
-    # Look up player names
-    print("👤 Looking up player names...")
-    batter_ids = latest['batter'].dropna().astype(int).unique().tolist()
+    # Player name lookup
+    print("🔍 Looking up player names...")
+    batter_ids = latest['batter'].dropna().unique().tolist()
+    batter_ids = [int(b) for b in batter_ids]
+
     try:
         id_lookup = playerid_reverse_lookup(batter_ids, key_type='mlbam')
-        id_lookup['full_name'] = id_lookup['name_first'].str.capitalize() + ' ' + id_lookup['name_last'].str.capitalize()
-        id_map = dict(zip(id_lookup['key_mlbam'], id_lookup['full_name']))
+        id_lookup['full_name'] = id_lookup.apply(
+            lambda row: format_name(str(row['name_first'])) + ' ' + format_name(str(row['name_last'])), axis=1
+        )
+        id_lookup = id_lookup.rename(columns={'key_mlbam': 'batter'})
+        latest = latest.merge(id_lookup[['batter', 'full_name']], on='batter', how='left')
+        latest['player_name'] = latest['full_name'].fillna('Unknown Player')
     except Exception as e:
-        print(f"⚠️ Player lookup failed: {e}")
-        id_map = {}
+        print(f"⚠️ Name lookup failed: {e}")
+        latest['player_name'] = 'Unknown Player'
+
+    # Team placeholder
+    latest['team'] = 'TBD'
+
+    player_stats = latest[['player_name', 'team', 'projected_prob']].copy()
 
     # Build predictions list
     predictions = []
-    for _, row in latest.iterrows():
-        prob = round(float(row['hr_prob']) * 100, 4)
-        batter_id = int(row['batter'])
-        player_name = id_map.get(batter_id, 'Unknown Player')
-
+    for _, row in player_stats.iterrows():
+        prob = float(row['projected_prob'])
         edge = round((prob / 100) - 0.5, 4)
 
         if prob >= 2:
@@ -120,34 +134,42 @@ def run_mlb_model():
             confidence = "Low"
 
         predictions.append({
-            "game_date": today,
-            "player_name": player_name,
-            "team": "TBD",
-            "prop_type": "Home Run",
-            "projected_prob": prob,
-            "implied_line": 0.5,
-            "edge": edge,
-            "confidence": confidence
+            'player_name': row['player_name'],
+            'team': row['team'],
+            'projected_prob': round(prob, 4),
+            'confidence': confidence,
+            'edge': edge,
+            'game_date': today,
+            'prop_type': 'home_run'
         })
 
-    # Insert into Supabase
-    if predictions:
-        print(f"💾 Inserting {len(predictions)} predictions into Supabase...")
-        supabase.table("prop_predictions").insert(predictions).execute()
-        print("✅ Predictions saved successfully!")
-    else:
-        print("⚠️ No predictions generated.")
+    print(f"✅ Generated {len(predictions)} predictions")
 
-    # Send Discord notification
+    # Save to Supabase
+    print("💾 Saving to Supabase...")
+    try:
+        # Delete today's existing predictions first to avoid duplicates
+        supabase.table("predictions").delete().eq("game_date", today).execute()
+        # Insert in batches of 100
+        batch_size = 100
+        for i in range(0, len(predictions), batch_size):
+            batch = predictions[i:i + batch_size]
+            supabase.table("predictions").insert(batch).execute()
+        print(f"✅ Saved {len(predictions)} predictions to Supabase")
+    except Exception as e:
+        print(f"⚠️ Supabase save failed: {e}")
+
+    # Build confidence buckets
     high_conf = [p for p in predictions if p['confidence'] == 'High']
     medium_conf = [p for p in predictions if p['confidence'] == 'Medium']
     low_conf = [p for p in predictions if p['confidence'] == 'Low']
 
-    # Filter out unknown players from top picks
+    # Filter out unknown players
     high_conf_named = [p for p in high_conf if p['player_name'] != 'Unknown Player']
     medium_conf_named = [p for p in medium_conf if p['player_name'] != 'Unknown Player']
     low_conf_named = [p for p in low_conf if p['player_name'] != 'Unknown Player']
 
+    # Send Discord notification
     webhook = DiscordWebhook(url=DISCORD_WEBHOOK_URL)
     embed = DiscordEmbed(
         title="⚾ MLB Prop Model Daily Update",
@@ -183,6 +205,7 @@ def run_mlb_model():
     webhook.add_embed(embed)
     webhook.execute()
     print("📣 Discord notification sent!")
+
 
 if __name__ == "__main__":
     run_mlb_model()
