@@ -24,13 +24,12 @@ if not all([SUPABASE_URL, SUPABASE_KEY, DISCORD_WEBHOOK_URL]):
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 def run_mlb_model():
     print("🚀 Starting MLB Prop Model Runner...")
 
-    # Step 1: Pull Statcast data
-    today = datetime.today().strftime('%Y-%m-%d')
-    start_date = (datetime.today() - timedelta(days=3 * 365)).strftime('%Y-%m-%d')
+    # Use UTC time to avoid GitHub Actions date issues
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    start_date = (datetime.utcnow() - timedelta(days=3 * 365)).strftime('%Y-%m-%d')
 
     print(f"📊 Pulling Statcast data from {start_date} to {today}...")
 
@@ -87,28 +86,29 @@ def run_mlb_model():
     )
     model.fit(X, y)
 
-    # Generate today's predictions
+    # Generate predictions using last 30 days of data
     print("🔮 Generating today's predictions...")
-    recent = df[df['game_date'] >= (datetime.today() - timedelta(days=30)).date()]
+    recent_cutoff = (datetime.utcnow() - timedelta(days=30)).date()
+    recent = df[df['game_date'] >= recent_cutoff]
 
-    player_stats = recent.groupby('batter').agg({
-        'hard_hit_rate': 'mean',
-        'launch_speed_avg': 'mean',
-        'launch_angle_avg': 'mean'
-    }).reset_index()
+    player_stats = recent.groupby('batter').agg(
+        hard_hit_rate=('hard_hit_rate', 'mean'),
+        launch_speed_avg=('launch_speed_avg', 'mean'),
+        launch_angle_avg=('launch_angle_avg', 'mean')
+    ).reset_index()
 
     player_stats = player_stats.dropna(subset=features)
 
     if player_stats.empty:
-        print("⚠️ No player stats available. Exiting.")
+        print("⚠️ No player stats available for predictions. Exiting.")
         return
 
-    # Look up real player names
-    print("👤 Looking up player names...")
+    # Resolve real player names
+    print("🔍 Looking up player names...")
     try:
         batter_ids = player_stats['batter'].tolist()
         id_map = playerid_reverse_lookup(batter_ids, key_type='mlbam')
-        id_map['full_name'] = id_map['name_first'].str.capitalize() + ' ' + id_map['name_last'].str.capitalize()
+        id_map['full_name'] = id_map['name_first'] + ' ' + id_map['name_last']
         id_map = id_map[['key_mlbam', 'full_name']]
         player_stats = player_stats.merge(id_map, left_on='batter', right_on='key_mlbam', how='left')
         player_stats['player_name'] = player_stats['full_name'].fillna(
@@ -121,11 +121,25 @@ def run_mlb_model():
     player_stats['team'] = "TBD"
     player_stats['projected_prob'] = model.predict_proba(player_stats[features])[:, 1] * 100
 
-    # Prepare predictions for Supabase
+    # Build predictions list with realistic HR thresholds
     predictions = []
     for index, row in player_stats.iterrows():
         prob = float(row['projected_prob'])
+
+        # Skip extremely unlikely players
+        if prob < 3:
+            continue
+
         edge = round((prob / 100) - 0.5, 4)
+
+        # Realistic HR probability confidence tiers
+        if prob >= 15:
+            confidence = "High"
+        elif prob >= 8:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
         predictions.append({
             "game_date": today,
             "player_name": row['player_name'],
@@ -134,7 +148,7 @@ def run_mlb_model():
             "projected_prob": round(prob, 4),
             "implied_line": 0.5,
             "edge": edge,
-            "confidence": "High" if prob >= 70 else "Medium" if prob >= 55 else "Low"
+            "confidence": confidence
         })
 
     # Insert into Supabase
@@ -143,7 +157,7 @@ def run_mlb_model():
         supabase.table("prop_predictions").insert(predictions).execute()
         print("✅ Predictions saved successfully!")
     else:
-        print("⚠️ No predictions generated.")
+        print("⚠️ No predictions met the minimum threshold.")
 
     # Send Discord notification
     high_conf = [p for p in predictions if p['confidence'] == 'High']
@@ -156,12 +170,19 @@ def run_mlb_model():
         description=f"Generated **{len(predictions)}** predictions for **{today}**",
         color="03b2f8"
     )
-    embed.add_embed_field(name="🔥 High Confidence (≥70%)", value=str(len(high_conf)), inline=True)
-    embed.add_embed_field(name="✅ Medium Confidence (≥55%)", value=str(len(medium_conf)), inline=True)
-    embed.add_embed_field(name="📉 Low Confidence (<55%)", value=str(len(low_conf)), inline=True)
+    embed.add_embed_field(name="🔥 High Confidence (≥15%)", value=str(len(high_conf)), inline=True)
+    embed.add_embed_field(name="✅ Medium Confidence (≥8%)", value=str(len(medium_conf)), inline=True)
+    embed.add_embed_field(name="📉 Low Confidence (3-8%)", value=str(len(low_conf)), inline=True)
 
     if high_conf:
         top_picks = sorted(high_conf, key=lambda x: x['projected_prob'], reverse=True)[:5]
+        top_str = "\n".join([
+            f"**{p['player_name']}** — {p['projected_prob']:.1f}% HR prob"
+            for p in top_picks
+        ])
+        embed.add_embed_field(name="🎯 Top Picks Today", value=top_str, inline=False)
+    elif medium_conf:
+        top_picks = sorted(medium_conf, key=lambda x: x['projected_prob'], reverse=True)[:5]
         top_str = "\n".join([
             f"**{p['player_name']}** — {p['projected_prob']:.1f}% HR prob"
             for p in top_picks
@@ -171,7 +192,6 @@ def run_mlb_model():
     webhook.add_embed(embed)
     webhook.execute()
     print("📣 Discord notification sent!")
-
 
 if __name__ == "__main__":
     run_mlb_model()
